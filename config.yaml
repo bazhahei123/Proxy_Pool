@@ -1,0 +1,70 @@
+runtime:
+  timeout_seconds: 20
+  max_concurrency: 50
+  verify_tls: true
+
+selector:
+  mode: fixed_count
+  rotate_after: 5
+  max_attempts_on_block: 3
+  block_statuses: [403, 418, 429]
+  block_header_matches: {}
+  block_redirect_prefixes: []
+  max_attempts_on_transport: 2
+  cooldown_seconds: 60
+
+diagnostics:
+  ip_check_url: "https://api.ipify.org?format=json"
+  health_urls: []
+  allowed_ports: [80, 443]
+
+gost:
+  binary_dir: "./GOST"
+  version: "3.3.0"
+
+reverse_tunnel:
+  enabled: true
+  # Public IP address or hostname of the hub VPS running install.py.
+  hub_host: "MIDDLE_VPS_PUBLIC_IP"
+  relay_host: "0.0.0.0"
+  relay_port: 443
+  relay_username: proxy
+  relay_password: "${GOST_PROXY_PASSWORD}"
+  # Reverse entries listen only on the hub VPS and are not publicly exposed.
+  entry_host: "127.0.0.1"
+  # Enabled nodes automatically use 11000, 11001, 11002, and so on.
+  entry_port_base: "11000-11010"
+
+proxies:
+  - id: server-01
+    kind: reverse_gost_client
+    ssh:
+      host: FIRST_VPS_IP
+      port: 45544
+      username: root
+      password: "${SSH_PASSWORD}"
+    gost:
+      remote_port: 1080
+      install_dir: /usr/local/lib/proxy-pool
+
+  - id: server-02
+    kind: reverse_gost_client
+    ssh:
+      host: SECOND_VPS_IP
+      port: 22
+      username: root
+      password: "${SSH_PASSWORD_2}"
+    gost:
+      remote_port: 1080
+      install_dir: /usr/local/lib/proxy-pool
+
+  - id: server-03
+    kind: reverse_gost_client
+    ssh:
+      host: THIRD_VPS_IP
+      port: 22
+      username: root
+      password: "${SSH_PASSWORD_3}"
+    gost:
+      remote_port: 1080
+      install_dir: /usr/local/lib/proxy-pool

@@ -1,0 +1,4 @@
+paramiko>=3.4,<4
+httpx[socks]>=0.28,<1
+PyYAML>=6.0,<7
+pytest>=8,<10

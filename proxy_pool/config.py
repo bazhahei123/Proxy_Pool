@@ -1,0 +1,218 @@
+from __future__ import annotations
+
+import os
+import re
+from pathlib import Path
+from typing import Any
+
+import yaml
+
+from .errors import ConfigError
+from .models import (
+    AppConfig,
+    DiagnosticsConfig,
+    DirectProxyConfig,
+    GostNodeConfig,
+    ProxyNodeConfig,
+    RuntimeConfig,
+    ReverseTunnelConfig,
+    SSHConfig,
+    SelectorConfig,
+)
+
+_ENV = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-(.*?))?\}")
+
+
+def _expand(value: Any) -> Any:
+    if isinstance(value, str):
+        def repl(match: re.Match[str]) -> str:
+            name, default = match.group(1), match.group(2)
+            if name in os.environ:
+                return os.environ[name]
+            if default is not None:
+                return default
+            raise ConfigError(f"environment variable {name!r} is not set")
+
+        return _ENV.sub(repl, value)
+    if isinstance(value, dict):
+        return {k: _expand(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_expand(v) for v in value]
+    return value
+
+
+def _mapping(value: Any, name: str) -> dict[str, Any]:
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise ConfigError(f"{name} must be a mapping")
+    return value
+
+
+def _required(mapping: dict[str, Any], key: str, path: str) -> Any:
+    if key not in mapping or mapping[key] in (None, ""):
+        raise ConfigError(f"missing {path}.{key}")
+    return mapping[key]
+
+
+def load_config(source: str | Path | dict[str, Any] | AppConfig) -> AppConfig:
+    if isinstance(source, AppConfig):
+        return source
+    base = Path.cwd()
+    if isinstance(source, (str, Path)):
+        path = Path(source)
+        base = path.resolve().parent
+        try:
+            raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        except OSError as exc:
+            raise ConfigError(f"cannot read config {path}: {exc}") from exc
+    else:
+        raw = source
+    raw = _expand(raw)
+    if not isinstance(raw, dict):
+        raise ConfigError("config root must be a mapping")
+
+    runtime_raw = _mapping(raw.get("runtime"), "runtime")
+    runtime = RuntimeConfig(
+        timeout_seconds=float(runtime_raw.get("timeout_seconds", 20)),
+        max_concurrency=int(runtime_raw.get("max_concurrency", 50)),
+        verify_tls=bool(runtime_raw.get("verify_tls", True)),
+    )
+    if runtime.timeout_seconds <= 0 or runtime.max_concurrency <= 0:
+        raise ConfigError("runtime timeout and max_concurrency must be positive")
+
+    selector_raw = _mapping(raw.get("selector"), "selector")
+    mode = selector_raw.get("mode", "fixed_count")
+    if mode not in {"fixed_count", "adaptive_403"}:
+        raise ConfigError("selector.mode must be fixed_count or adaptive_403")
+    selector = SelectorConfig(
+        mode=mode,
+        rotate_after=int(selector_raw.get("rotate_after", 5)),
+        max_attempts_on_403=int(selector_raw.get("max_attempts_on_block", selector_raw.get("max_attempts_on_403", 3))),
+        block_statuses=[int(s) for s in selector_raw.get("block_statuses", [403, 418, 429])],
+        block_header_matches={str(k): str(v) for k, v in _mapping(selector_raw.get("block_header_matches"), "selector.block_header_matches").items()},
+        block_redirect_prefixes=[str(prefix) for prefix in selector_raw.get("block_redirect_prefixes", [])],
+        max_attempts_on_transport=int(selector_raw.get("max_attempts_on_transport", 2)),
+        cooldown_seconds=float(selector_raw.get("cooldown_seconds", 60)),
+    )
+    if selector.rotate_after <= 0 or selector.max_attempts_on_403 <= 0:
+        raise ConfigError("selector counts must be positive")
+    if any(status < 400 or status > 599 for status in selector.block_statuses):
+        raise ConfigError("selector.block_statuses must contain HTTP 4xx/5xx codes")
+    if any(not name.strip() or not value.strip() for name, value in selector.block_header_matches.items()):
+        raise ConfigError("selector.block_header_matches requires non-empty header names and values")
+    if any(not prefix.startswith(("http://", "https://")) for prefix in selector.block_redirect_prefixes):
+        raise ConfigError("selector.block_redirect_prefixes requires absolute http(s) URL prefixes")
+
+    diagnostics_raw = _mapping(raw.get("diagnostics"), "diagnostics")
+    diagnostics = DiagnosticsConfig(
+        ip_check_url=diagnostics_raw.get("ip_check_url"),
+        health_urls=list(diagnostics_raw.get("health_urls", [])),
+        allowed_ports=[int(p) for p in diagnostics_raw.get("allowed_ports", [80, 443])],
+    )
+
+    gost_raw = _mapping(raw.get("gost"), "gost")
+    reverse_raw = _mapping(raw.get("reverse_tunnel"), "reverse_tunnel")
+    reverse_tunnel = ReverseTunnelConfig(
+        enabled=bool(reverse_raw.get("enabled", False)),
+        hub_host=str(reverse_raw.get("hub_host", "")),
+        relay_host=str(reverse_raw.get("relay_host", "0.0.0.0")),
+        relay_port=int(reverse_raw.get("relay_port", 443)),
+        relay_username=reverse_raw.get("relay_username"),
+        relay_password=reverse_raw.get("relay_password"),
+        hub_entry_host=str(reverse_raw.get("entry_host", reverse_raw.get("hub_entry_host", "127.0.0.1"))),
+        entry_port_base=int(str(reverse_raw.get("entry_port_base", 11000)).split("-", 1)[0]),
+        entry_port_end=int(str(reverse_raw.get("entry_port_base", 11000)).split("-", 1)[-1]),
+    )
+    if reverse_tunnel.enabled and not reverse_tunnel.hub_host:
+        raise ConfigError("reverse_tunnel.hub_host is required when reverse_tunnel.enabled is true")
+    if reverse_tunnel.entry_port_base <= 0 or reverse_tunnel.entry_port_end < reverse_tunnel.entry_port_base:
+        raise ConfigError("reverse_tunnel.entry_port_base must be a port or ascending port range")
+    global_binary = gost_raw.get("binary_path")
+    gost_binary = (base / global_binary).resolve() if global_binary else None
+    global_binary_dir = gost_raw.get("binary_dir")
+    gost_binary_dir = (base / global_binary_dir).resolve() if global_binary_dir else None
+
+    nodes_raw = raw.get("proxies")
+    if not isinstance(nodes_raw, list) or not nodes_raw:
+        raise ConfigError("proxies must be a non-empty list")
+    nodes: list[ProxyNodeConfig] = []
+    ids: set[str] = set()
+    for index, node_raw in enumerate(nodes_raw):
+        path = f"proxies[{index}]"
+        node = _mapping(node_raw, path)
+        node_id = str(_required(node, "id", path))
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}", node_id):
+            raise ConfigError(f"{path}.id contains unsupported characters")
+        if node_id in ids:
+            raise ConfigError(f"duplicate proxy id {node_id!r}")
+        ids.add(node_id)
+        kind = node.get("kind")
+        if kind not in {"direct", "managed_ssh", "managed_gost", "reverse_gost_client"}:
+            raise ConfigError(f"{path}.kind must be direct, managed_ssh, managed_gost, or reverse_gost_client")
+
+        if kind == "direct":
+            p = _mapping(node.get("proxy"), f"{path}.proxy")
+            scheme = str(_required(p, "scheme", f"{path}.proxy")).lower()
+            if scheme not in {"http", "https", "socks5"}:
+                raise ConfigError(f"unsupported proxy scheme {scheme!r}")
+            direct = DirectProxyConfig(
+                scheme=scheme,
+                host=str(_required(p, "host", f"{path}.proxy")),
+                port=int(_required(p, "port", f"{path}.proxy")),
+                username=p.get("username"),
+                password=p.get("password"),
+            )
+            nodes.append(ProxyNodeConfig(node_id, kind, direct=direct, enabled=bool(node.get("enabled", True))))
+            continue
+
+        ssh_raw = _mapping(node.get("ssh"), f"{path}.ssh")
+        ssh = SSHConfig(
+            host=str(_required(ssh_raw, "host", f"{path}.ssh")),
+            port=int(ssh_raw.get("port", 22)),
+            username=str(_required(ssh_raw, "username", f"{path}.ssh")),
+            password=ssh_raw.get("password"),
+            private_key=(base / ssh_raw["private_key"]).resolve() if ssh_raw.get("private_key") else None,
+            passphrase=ssh_raw.get("passphrase"),
+            known_hosts=(base / ssh_raw["known_hosts"]).resolve() if ssh_raw.get("known_hosts") else None,
+        )
+        node_gost_raw = _mapping(node.get("gost"), f"{path}.gost")
+        gost = GostNodeConfig(
+            binary_path=(base / node_gost_raw["binary_path"]).resolve() if node_gost_raw.get("binary_path") else gost_binary,
+            binary_dir=(base / node_gost_raw["binary_dir"]).resolve() if node_gost_raw.get("binary_dir") else gost_binary_dir,
+            version=str(node_gost_raw.get("version", gost_raw.get("version", "3.x"))),
+            sha256=node_gost_raw.get("sha256", gost_raw.get("sha256")),
+            remote_bind_host=str(node_gost_raw.get("remote_bind_host", "127.0.0.1")),
+            remote_port=int(node_gost_raw.get("remote_port", 1080)),
+            username=node_gost_raw.get("username"),
+            password=node_gost_raw.get("password"),
+            local_host=str(node_gost_raw.get("local_host", "127.0.0.1")),
+            local_port=int(node_gost_raw.get("local_port", 0)),
+            install_dir=str(node_gost_raw.get("install_dir", "/usr/local/lib/proxy-pool")),
+            public_host=node_gost_raw.get("public_host"),
+            public_port=(int(node_gost_raw["public_port"]) if node_gost_raw.get("public_port") is not None else None),
+            tunnel_id=node_gost_raw.get("tunnel_id", node_id),
+            hub_entry_port=(int(node_gost_raw["hub_entry_port"]) if node_gost_raw.get("hub_entry_port") is not None else None),
+        )
+        if not gost.binary_path and not gost.binary_dir:
+            raise ConfigError(f"{path}.gost.binary_path or binary_dir is required")
+        nodes.append(ProxyNodeConfig(node_id, kind, ssh=ssh, gost=gost, enabled=bool(node.get("enabled", True))))
+
+    if reverse_tunnel.enabled:
+        reverse_nodes = [n for n in nodes if n.enabled and n.kind == "reverse_gost_client"]
+        available = list(range(reverse_tunnel.entry_port_base, reverse_tunnel.entry_port_end + 1))
+        if len(reverse_nodes) > len(available):
+            raise ConfigError(
+                f"reverse_tunnel entry port range has {len(available)} ports but "
+                f"{len(reverse_nodes)} reverse nodes are enabled"
+            )
+        used: set[int] = set()
+        for index, node in enumerate(reverse_nodes):
+            assert node.gost is not None
+            port = node.gost.hub_entry_port or available[index]
+            if port in used or port not in available:
+                raise ConfigError(f"duplicate or out-of-range reverse entry port {port} for {node.id}")
+            node.gost.hub_entry_port = port
+            node.gost.public_host = reverse_tunnel.hub_entry_host
+            used.add(port)
+    return AppConfig(runtime, selector, diagnostics, nodes, gost_binary, gost_binary_dir, str(gost_raw.get("version", "3.x")), gost_raw.get("sha256"), reverse_tunnel)
