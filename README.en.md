@@ -44,12 +44,12 @@ Open only the Relay inbound port in the hub security group. Remote VPS nodes do 
 
 ```yaml
 diagnostics:
-  ip_check_url: "https://api.ipify.org?format=json"
+  ip_check_url: "https://ip.3322.net"
   health_urls:
     - "https://your-authorized-host/health"
 ```
 
-The IP URL confirms the public egress address through the proxy. Replace it with an endpoint you control if ipify is unavailable. Health URLs should return 200-399; use a 403 page as a business target, not as an installation health URL.
+The IP URL confirms the public egress address through the proxy. Replace it with an endpoint you control if this service is unavailable. Health URLs should return 200-399; use a 403 page as a business target, not as an installation health URL.
 
 ## Synchronous usage
 

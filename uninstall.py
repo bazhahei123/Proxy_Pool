@@ -58,7 +58,11 @@ def _stop_remote(node, operation: str, timeout: float) -> None:
     )
     try:
         service = _service_name(node.id)
-        commands = [f"sudo systemctl stop {shlex.quote(service)} || true"]
+        reverse_service = f"proxy-pool-gost-{node.id}-reverse.service"
+        commands = [
+            f"sudo systemctl stop {shlex.quote(service)} || true",
+            f"sudo systemctl stop {shlex.quote(reverse_service)} || true",
+        ]
         if operation in {"clean", "purge"} and node.gost:
             commands.append(f"sudo rm -f -- {shlex.quote(node.gost.install_dir + '/gost')}")
         _, stdout, stderr = client.exec_command(" && ".join(commands))

@@ -12,6 +12,7 @@ import shlex
 import subprocess
 import tarfile
 import tempfile
+import time
 from pathlib import Path
 
 import paramiko
@@ -75,7 +76,7 @@ def _install_local_relay(config: AppConfig) -> None:
     _run(f"sudo mkdir -p /usr/local/lib/proxy-pool && sudo install -m 0755 {shlex.quote(str(binary))} {tmp} && sudo install -m 0755 {tmp} {remote_bin} && sudo rm -f {tmp}")
     service = "proxy-pool-gost-relay.service"
     encoded = shlex.quote(unit)
-    _run(f"printf %s {encoded} | sudo tee /etc/systemd/system/{service} >/dev/null && sudo systemctl daemon-reload && sudo systemctl enable --now {service} && sudo systemctl is-active --quiet {service}")
+    _run(f"printf %s {encoded} | sudo tee /etc/systemd/system/{service} >/dev/null && sudo systemctl daemon-reload && sudo systemctl enable --now {service} && sudo systemctl restart {service} && sudo systemctl is-active --quiet {service}")
     print(f"[OK] relay active on {relay.relay_host}:{relay.relay_port}; sha256={digest}")
 
 
@@ -106,22 +107,40 @@ def _remote_install(config: AppConfig, node: ProxyNodeConfig) -> None:
         sftp = client.open_sftp(); sftp.put(str(binary), tmp); sftp.close()
         user = relay.relay_username or ""
         password = relay.relay_password or ""
-        forward = f"rtcp://:{node.gost.hub_entry_port}/127.0.0.1:{node.gost.remote_port}"
+        # The relay must receive an explicit bind host.  An empty host makes
+        # GOST 3.3 build the invalid address 0.0.0.0::PORT on the hub.
+        forward = (
+            f"rtcp://{relay.hub_entry_host}:{node.gost.hub_entry_port}/"
+            f"127.0.0.1:{node.gost.remote_port}"
+        )
         relay_url = f"relay://{user}:{password}@{relay.hub_host}:{relay.relay_port}"
         service = f"proxy-pool-gost-{node.id}.service"
-        unit = "\n".join([
+        reverse_service = f"proxy-pool-gost-{node.id}-reverse.service"
+        local_unit = "\n".join([
             "[Unit]", "Description=Proxy Pool Reverse GOST Client", "After=network-online.target",
             "[Service]", "Type=simple",
-            f"ExecStart={remote_bin} -L socks5://127.0.0.1:{node.gost.remote_port} -L {forward} -F {relay_url}",
+            # This listener must be direct. It is the egress path on the
+            # remote VPS and must not inherit the Relay forwarding chain.
+            f"ExecStart={remote_bin} -L socks5://127.0.0.1:{node.gost.remote_port}",
+            "Restart=always", "RestartSec=3", "[Install]", "WantedBy=multi-user.target", "",
+        ])
+        reverse_unit = "\n".join([
+            "[Unit]", "Description=Proxy Pool Reverse GOST Relay Client", "After=network-online.target",
+            "[Service]", "Type=simple",
+            f"ExecStart={remote_bin} -L {forward} -F {relay_url}",
             "Restart=always", "RestartSec=3", "[Install]", "WantedBy=multi-user.target", "",
         ])
         command = " && ".join([
             f"sudo mkdir -p {shlex.quote(node.gost.install_dir)}",
             f"sudo install -m 0755 {shlex.quote(tmp)} {shlex.quote(remote_bin)}",
             f"sudo rm -f {shlex.quote(tmp)}",
-            f"printf %s {shlex.quote(unit)} | sudo tee /etc/systemd/system/{service} >/dev/null",
+            f"printf %s {shlex.quote(local_unit)} | sudo tee /etc/systemd/system/{service} >/dev/null",
+            f"printf %s {shlex.quote(reverse_unit)} | sudo tee /etc/systemd/system/{reverse_service} >/dev/null",
             "sudo systemctl daemon-reload",
             f"sudo systemctl enable --now {service}",
+            f"sudo systemctl restart {service}",
+            f"sudo systemctl enable --now {reverse_service}",
+            f"sudo systemctl restart {reverse_service}",
             f"sudo systemctl is-active --quiet {service}",
         ])
         _, stdout, stderr = client.exec_command(command)
@@ -149,16 +168,31 @@ def install_reverse(config: AppConfig) -> int:
             print(f"  - {item}")
         return 1
     try:
-        pool = SyncProxyPool.connect(config_to_source(config))
-        try:
-            snapshot = pool.health_snapshot()
-            print(snapshot)
-            bad = [node_id for node_id, value in snapshot.items() if not value.get("egress_ip")]
-            if bad:
-                print("[FAIL] reverse tunnel health: " + ", ".join(bad))
-                return 1
-        finally:
-            pool.close()
+        # Reverse clients need a short amount of time to authenticate with
+        # the Relay and create their remote entry listeners.
+        snapshot = {}
+        bad: list[str] = []
+        for attempt in range(1, 16):
+            pool = None
+            try:
+                pool = SyncProxyPool.connect(config_to_source(config))
+                snapshot = pool.health_snapshot()
+                bad = [node_id for node_id, value in snapshot.items() if not value.get("egress_ip")]
+            finally:
+                if pool is not None:
+                    pool.close()
+            if not bad:
+                break
+            print(f"[WAIT] reverse tunnel health attempt {attempt}/15; pending: {', '.join(bad)}")
+            time.sleep(2)
+        print(snapshot)
+        if bad:
+            print("[FAIL] reverse tunnel health: " + ", ".join(bad))
+            print("Check: sudo journalctl -u proxy-pool-gost-relay.service -n 50 --no-pager")
+            for node in config.proxies:
+                if node.enabled and node.kind == "reverse_gost_client":
+                    print(f"Check remote {node.id}: sudo journalctl -u proxy-pool-gost-{node.id}.service -n 50 --no-pager")
+            return 1
     except Exception as exc:
         print(f"[FAIL] reverse tunnel health: {type(exc).__name__}: {exc}")
         return 1

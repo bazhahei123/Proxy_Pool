@@ -14,7 +14,7 @@ selector:
   cooldown_seconds: 60
 
 diagnostics:
-  ip_check_url: "https://api.ipify.org?format=json"
+  ip_check_url: "https://ip.3322.net"
   health_urls: []
   allowed_ports: [80, 443]
 

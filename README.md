@@ -44,12 +44,12 @@ python3 uninstall.py purge config.yaml
 
 ```yaml
 diagnostics:
-  ip_check_url: "https://api.ipify.org?format=json"
+  ip_check_url: "https://ip.3322.net"
   health_urls:
     - "https://你的授权测试站点/health"
 ```
 
-ipify 用来确认代理后的公网出口 IP；无法访问时可以换成自有接口。健康 URL 应返回 200-399，403 页面应作为业务目标而不是安装健康地址。
+`ip.3322.net` 用来确认代理后的公网出口 IP；无法访问时可以换成自有接口。健康 URL 应返回 200-399，403 页面应作为业务目标而不是安装健康地址。
 
 ## 同步调用
 
