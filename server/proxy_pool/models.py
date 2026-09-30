@@ -6,7 +6,7 @@ from typing import Any, Literal
 
 
 ProxyKind = Literal["direct", "managed_ssh", "managed_gost", "reverse_gost_client"]
-SelectorMode = Literal["fixed_count", "adaptive_403"]
+SelectorMode = Literal["fixed_count", "adaptive_403", "random"]
 
 
 @dataclass(slots=True)
@@ -75,6 +75,16 @@ class ReverseTunnelConfig:
 
 
 @dataclass(slots=True)
+class GatewayConfig:
+    enabled: bool = False
+    listen_host: str = "127.0.0.1"
+    listen_port: int = 8080
+    username: str | None = None
+    password: str | None = None
+    session_ttl_seconds: int = 300
+
+
+@dataclass(slots=True)
 class ProxyNodeConfig:
     id: str
     kind: ProxyKind
@@ -121,6 +131,7 @@ class AppConfig:
     gost_version: str = "3.x"
     gost_sha256: str | None = None
     reverse_tunnel: ReverseTunnelConfig = field(default_factory=ReverseTunnelConfig)
+    gateway: GatewayConfig = field(default_factory=GatewayConfig)
 
 
 @dataclass(slots=True)

@@ -101,7 +101,7 @@ def _install_sync_reported(config_path: str) -> int:
     """Run installation with an explicit failure stage for every node."""
     config = load_config(config_path)
     if config.reverse_tunnel.enabled:
-        return install_reverse(config)
+        return install_reverse(config, config_path)
     if not config.diagnostics.ip_check_url and not config.diagnostics.health_urls:
         print("[FAIL] health-check configuration: set diagnostics.ip_check_url or health_urls")
         return 2
@@ -238,7 +238,7 @@ def _extract_binary(path):
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Deploy GOST to managed SSH nodes")
-    parser.add_argument("config", nargs="?", default="config.yaml")
+    parser.add_argument("config", nargs="?", default="server_config.yaml")
     args = parser.parse_args()
     raise SystemExit(_install_sync_reported(args.config))
 

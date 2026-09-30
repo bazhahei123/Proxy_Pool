@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import re
+import socket
 from pathlib import Path
 from typing import Any
 
@@ -16,6 +17,7 @@ from .models import (
     ProxyNodeConfig,
     RuntimeConfig,
     ReverseTunnelConfig,
+    GatewayConfig,
     SSHConfig,
     SelectorConfig,
 )
@@ -23,7 +25,21 @@ from .models import (
 _ENV = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-(.*?))?\}")
 
 
-def _expand(value: Any) -> Any:
+def _port_available(host: str, port: int) -> bool:
+    """Return whether the hub can bind the requested local entry port."""
+    family = socket.AF_INET6 if ":" in host and host != "0.0.0.0" else socket.AF_INET
+    sock = socket.socket(family, socket.SOCK_STREAM)
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind((host, port))
+        return True
+    except OSError:
+        return False
+    finally:
+        sock.close()
+
+
+def _expand(value: Any, allow_unset: bool = False) -> Any:
     if isinstance(value, str):
         def repl(match: re.Match[str]) -> str:
             name, default = match.group(1), match.group(2)
@@ -31,13 +47,15 @@ def _expand(value: Any) -> Any:
                 return os.environ[name]
             if default is not None:
                 return default
+            if allow_unset:
+                return match.group(0)
             raise ConfigError(f"environment variable {name!r} is not set")
 
         return _ENV.sub(repl, value)
     if isinstance(value, dict):
-        return {k: _expand(v) for k, v in value.items()}
+        return {k: _expand(v, allow_unset) for k, v in value.items()}
     if isinstance(value, list):
-        return [_expand(v) for v in value]
+        return [_expand(v, allow_unset) for v in value]
     return value
 
 
@@ -55,7 +73,7 @@ def _required(mapping: dict[str, Any], key: str, path: str) -> Any:
     return mapping[key]
 
 
-def load_config(source: str | Path | dict[str, Any] | AppConfig) -> AppConfig:
+def load_config(source: str | Path | dict[str, Any] | AppConfig, *, allow_unset_env: bool = False) -> AppConfig:
     if isinstance(source, AppConfig):
         return source
     base = Path.cwd()
@@ -68,7 +86,7 @@ def load_config(source: str | Path | dict[str, Any] | AppConfig) -> AppConfig:
             raise ConfigError(f"cannot read config {path}: {exc}") from exc
     else:
         raw = source
-    raw = _expand(raw)
+    raw = _expand(raw, allow_unset_env)
     if not isinstance(raw, dict):
         raise ConfigError("config root must be a mapping")
 
@@ -83,8 +101,8 @@ def load_config(source: str | Path | dict[str, Any] | AppConfig) -> AppConfig:
 
     selector_raw = _mapping(raw.get("selector"), "selector")
     mode = selector_raw.get("mode", "fixed_count")
-    if mode not in {"fixed_count", "adaptive_403"}:
-        raise ConfigError("selector.mode must be fixed_count or adaptive_403")
+    if mode not in {"fixed_count", "adaptive_403", "random"}:
+        raise ConfigError("selector.mode must be fixed_count, adaptive_403, or random")
     selector = SelectorConfig(
         mode=mode,
         rotate_after=int(selector_raw.get("rotate_after", 5)),
@@ -113,6 +131,17 @@ def load_config(source: str | Path | dict[str, Any] | AppConfig) -> AppConfig:
 
     gost_raw = _mapping(raw.get("gost"), "gost")
     reverse_raw = _mapping(raw.get("reverse_tunnel"), "reverse_tunnel")
+    gateway_raw = _mapping(raw.get("gateway"), "gateway")
+    gateway = GatewayConfig(
+        enabled=bool(gateway_raw.get("enabled", False)),
+        listen_host=str(gateway_raw.get("listen_host", "127.0.0.1")),
+        listen_port=int(gateway_raw.get("listen_port", 8080)),
+        username=gateway_raw.get("username"),
+        password=gateway_raw.get("password"),
+        session_ttl_seconds=int(gateway_raw.get("session_ttl_seconds", 300)),
+    )
+    if gateway.enabled and (gateway.listen_port <= 0 or gateway.session_ttl_seconds <= 0):
+        raise ConfigError("gateway listen_port and session_ttl_seconds must be positive")
     reverse_tunnel = ReverseTunnelConfig(
         enabled=bool(reverse_raw.get("enabled", False)),
         hub_host=str(reverse_raw.get("hub_host", "")),
@@ -207,12 +236,34 @@ def load_config(source: str | Path | dict[str, Any] | AppConfig) -> AppConfig:
                 f"{len(reverse_nodes)} reverse nodes are enabled"
             )
         used: set[int] = set()
-        for index, node in enumerate(reverse_nodes):
+        next_port = reverse_tunnel.entry_port_base
+        for node in reverse_nodes:
             assert node.gost is not None
-            port = node.gost.hub_entry_port or available[index]
+            if node.gost.hub_entry_port is not None:
+                port = node.gost.hub_entry_port
+                next_port = max(next_port, port + 1)
+            else:
+                attempts: list[int] = []
+                port = None
+                candidate = next_port
+                for _ in range(5):
+                    if candidate > reverse_tunnel.entry_port_end:
+                        break
+                    attempts.append(candidate)
+                    if candidate not in used and _port_available(reverse_tunnel.hub_entry_host, candidate):
+                        port = candidate
+                        next_port = candidate + 1
+                        break
+                    candidate += 1
+                if port is None:
+                    attempted = ", ".join(str(value) for value in attempts) or str(next_port)
+                    raise ConfigError(
+                        f"no available reverse entry port for {node.id}; "
+                        f"tried up to 5 ports: {attempted}"
+                    )
             if port in used or port not in available:
                 raise ConfigError(f"duplicate or out-of-range reverse entry port {port} for {node.id}")
             node.gost.hub_entry_port = port
             node.gost.public_host = reverse_tunnel.hub_entry_host
             used.add(port)
-    return AppConfig(runtime, selector, diagnostics, nodes, gost_binary, gost_binary_dir, str(gost_raw.get("version", "3.x")), gost_raw.get("sha256"), reverse_tunnel)
+    return AppConfig(runtime, selector, diagnostics, nodes, gost_binary, gost_binary_dir, str(gost_raw.get("version", "3.x")), gost_raw.get("sha256"), reverse_tunnel, gateway)

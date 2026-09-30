@@ -30,9 +30,19 @@ def _stop_local_relay(operation: str) -> None:
         detail = (result.stderr or result.stdout).strip()
         raise RuntimeError(detail or f"systemctl returned {result.returncode}")
     if operation == "purge":
-        subprocess.run(f"sudo rm -f /etc/systemd/system/{service} && sudo systemctl daemon-reload", shell=True, check=True)
+        subprocess.run(f"sudo rm -f /etc/systemd/system/{service} /etc/proxy-pool/gateway.env && sudo systemctl daemon-reload", shell=True, check=True)
         subprocess.run("sudo rm -rf -- /usr/local/lib/proxy-pool", shell=True, check=True)
     print(f"[OK] local Relay stopped ({operation})")
+
+
+def _stop_gateway(operation: str) -> None:
+    service = "proxy-pool-gateway.service"
+    result = subprocess.run(f"sudo systemctl stop {service}", shell=True, text=True, capture_output=True)
+    if result.returncode not in (0, 5):
+        raise RuntimeError((result.stderr or result.stdout).strip() or "gateway stop failed")
+    if operation == "purge":
+        subprocess.run(f"sudo rm -f /etc/systemd/system/{service} && sudo systemctl daemon-reload", shell=True, check=True)
+    print(f"[OK] local Gateway stopped ({operation})")
 
 
 def _stop_remote(node, operation: str, timeout: float) -> None:
@@ -75,7 +85,7 @@ def _stop_remote(node, operation: str, timeout: float) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser(description="Stop or clean Proxy Pool GOST tunnels")
     parser.add_argument("operation", choices=("stop", "clean", "purge"))
-    parser.add_argument("config", nargs="?", default="config.yaml")
+    parser.add_argument("config", nargs="?", default="server_config.yaml")
     args = parser.parse_args()
     config = load_config(args.config)
     failures: list[str] = []
@@ -86,6 +96,12 @@ def main() -> int:
         except Exception as exc:
             failures.append(f"hub Relay: {type(exc).__name__}: {exc}")
             print(f"[FAIL] hub Relay: {exc}")
+    if config.gateway.enabled:
+        try:
+            _stop_gateway(args.operation)
+        except Exception as exc:
+            failures.append(f"hub Gateway: {type(exc).__name__}: {exc}")
+            print(f"[FAIL] hub Gateway: {exc}")
 
     for node in config.proxies:
         if not node.enabled or node.kind not in {"reverse_gost_client", "managed_gost"}:

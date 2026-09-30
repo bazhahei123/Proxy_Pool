@@ -6,7 +6,7 @@ from proxy_pool import ProxyPool
 
 
 def main() -> int:
-    config = sys.argv[1] if len(sys.argv) > 1 else "config.yaml"
+    config = sys.argv[1] if len(sys.argv) > 1 else "server_config.yaml"
     url = sys.argv[2] if len(sys.argv) > 2 else "https://api.ipify.org?format=json"
     pool = ProxyPool.connect(config)
     try:

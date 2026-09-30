@@ -13,6 +13,7 @@ import subprocess
 import tarfile
 import tempfile
 import time
+import sys
 from pathlib import Path
 
 import paramiko
@@ -151,7 +152,26 @@ def _remote_install(config: AppConfig, node: ProxyNodeConfig) -> None:
         client.close()
 
 
-def install_reverse(config: AppConfig) -> int:
+def _install_gateway_service(config: AppConfig, config_path: str = "server_config.yaml") -> None:
+    if not config.gateway.enabled:
+        return
+    service = "proxy-pool-gateway.service"
+    config_path = Path(config_path).resolve()
+    env_file = "/etc/proxy-pool/gateway.env"
+    unit = "\n".join([
+        "[Unit]", "Description=Proxy Pool HTTP Gateway", "After=network-online.target",
+        "[Service]", "Type=simple", f"WorkingDirectory={config_path.parent}",
+        f"EnvironmentFile=-{env_file}",
+        f"ExecStart={sys.executable} -m proxy_pool.gateway_service {config_path}",
+        "Restart=always", "RestartSec=3", "[Install]", "WantedBy=multi-user.target", "",
+    ])
+    gateway_password = config.gateway.password or ""
+    env_line = f"GATEWAY_PASSWORD={shlex.quote(gateway_password)}\n"
+    _run(f"sudo mkdir -p /etc/proxy-pool && printf %s {shlex.quote(env_line)} | sudo tee {env_file} >/dev/null && sudo chmod 600 {env_file} && printf %s {shlex.quote(unit)} | sudo tee /etc/systemd/system/{service} >/dev/null && sudo systemctl daemon-reload && sudo systemctl enable --now {service} && sudo systemctl restart {service} && sudo systemctl is-active --quiet {service}")
+    print(f"[OK] gateway active on {config.gateway.listen_host}:{config.gateway.listen_port}")
+
+
+def install_reverse(config: AppConfig, config_path: str = "server_config.yaml") -> int:
     _install_local_relay(config)
     failures: list[str] = []
     for node in config.proxies:
@@ -166,6 +186,11 @@ def install_reverse(config: AppConfig) -> int:
         print("\nReverse installation failed:")
         for item in failures:
             print(f"  - {item}")
+        return 1
+    try:
+        _install_gateway_service(config, config_path)
+    except Exception as exc:
+        print(f"[FAIL] gateway service startup: {type(exc).__name__}: {exc}")
         return 1
     try:
         # Reverse clients need a short amount of time to authenticate with

@@ -32,6 +32,9 @@ class ProxySelector:
         if not self.nodes:
             return None
         excluded_set = set(excluded)
+        if self.config.mode == "random":
+            eligible = [node for node in self.nodes if self._eligible(node, origin, excluded_set)]
+            return random.choice(eligible) if eligible else None
         size = len(self.nodes)
         for offset in range(size):
             idx = (self._index + offset) % size

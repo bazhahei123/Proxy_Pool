@@ -1,0 +1,2 @@
+httpx[socks]>=0.28,<1
+PyYAML>=6.0,<7
