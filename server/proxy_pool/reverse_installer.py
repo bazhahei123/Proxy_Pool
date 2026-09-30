@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import platform
 import shlex
+import shutil
 import subprocess
 import tarfile
 import tempfile
@@ -50,6 +51,15 @@ def _extract(path: Path) -> Path:
     return found[0]
 
 
+def _cleanup_extract(binary: Path) -> None:
+    """Remove a temporary archive extraction directory, if one was created."""
+    temp_root = Path(tempfile.gettempdir()).resolve()
+    for parent in binary.resolve().parents:
+        if parent.parent == temp_root and parent.name.startswith("proxy-pool-gost-"):
+            shutil.rmtree(parent, ignore_errors=True)
+            return
+
+
 def _local_suffix() -> str:
     machine = platform.machine().lower()
     if machine in {"aarch64", "arm64"}:
@@ -62,23 +72,26 @@ def _local_suffix() -> str:
 def _install_local_relay(config: AppConfig) -> None:
     relay = config.reverse_tunnel
     binary = _extract(_artifact(config, _local_suffix()))
-    remote_bin = "/usr/local/lib/proxy-pool/gost"
-    auth = ""
-    if relay.relay_username:
-        auth = f"{relay.relay_username}:{relay.relay_password or ''}@"
-    listen = f"relay://{auth}{relay.relay_host}:{relay.relay_port}?bind=true"
-    unit = "\n".join([
-        "[Unit]", "Description=Proxy Pool GOST Relay", "After=network-online.target",
-        "[Service]", "Type=simple", f"ExecStart={remote_bin} -L {listen}",
-        "Restart=always", "RestartSec=3", "[Install]", "WantedBy=multi-user.target", "",
-    ])
-    digest = hashlib.sha256(binary.read_bytes()).hexdigest()
-    tmp = f"/tmp/proxy-pool-gost-{digest[:12]}"
-    _run(f"sudo mkdir -p /usr/local/lib/proxy-pool && sudo install -m 0755 {shlex.quote(str(binary))} {tmp} && sudo install -m 0755 {tmp} {remote_bin} && sudo rm -f {tmp}")
-    service = "proxy-pool-gost-relay.service"
-    encoded = shlex.quote(unit)
-    _run(f"printf %s {encoded} | sudo tee /etc/systemd/system/{service} >/dev/null && sudo systemctl daemon-reload && sudo systemctl enable --now {service} && sudo systemctl restart {service} && sudo systemctl is-active --quiet {service}")
-    print(f"[OK] relay active on {relay.relay_host}:{relay.relay_port}; sha256={digest}")
+    try:
+        remote_bin = "/usr/local/lib/proxy-pool/gost"
+        auth = ""
+        if relay.relay_username:
+            auth = f"{relay.relay_username}:{relay.relay_password or ''}@"
+        listen = f"relay://{auth}{relay.relay_host}:{relay.relay_port}?bind=true"
+        unit = "\n".join([
+            "[Unit]", "Description=Proxy Pool GOST Relay", "After=network-online.target",
+            "[Service]", "Type=simple", f"ExecStart={remote_bin} -L {listen}",
+            "Restart=always", "RestartSec=3", "[Install]", "WantedBy=multi-user.target", "",
+        ])
+        digest = hashlib.sha256(binary.read_bytes()).hexdigest()
+        tmp = f"/tmp/proxy-pool-gost-{digest[:12]}"
+        _run(f"sudo mkdir -p /usr/local/lib/proxy-pool && sudo install -m 0755 {shlex.quote(str(binary))} {tmp} && sudo install -m 0755 {tmp} {remote_bin} && sudo rm -f {tmp}")
+        service = "proxy-pool-gost-relay.service"
+        encoded = shlex.quote(unit)
+        _run(f"printf %s {encoded} | sudo tee /etc/systemd/system/{service} >/dev/null && sudo systemctl daemon-reload && sudo systemctl enable --now {service} && sudo systemctl restart {service} && sudo systemctl is-active --quiet {service}")
+        print(f"[OK] relay active on {relay.relay_host}:{relay.relay_port}; sha256={digest}")
+    finally:
+        _cleanup_extract(binary)
 
 
 def _remote_install(config: AppConfig, node: ProxyNodeConfig) -> None:
@@ -96,6 +109,7 @@ def _remote_install(config: AppConfig, node: ProxyNodeConfig) -> None:
                    password=node.ssh.password,
                    key_filename=str(node.ssh.private_key) if node.ssh.private_key else None,
                    passphrase=node.ssh.passphrase, timeout=config.runtime.timeout_seconds)
+    binary: Path | None = None
     try:
         _, out, _ = client.exec_command("uname -a")
         text = out.read().decode(errors="replace").lower()
@@ -149,6 +163,8 @@ def _remote_install(config: AppConfig, node: ProxyNodeConfig) -> None:
             raise RuntimeError(stderr.read().decode(errors="replace").strip() or "systemd startup failed")
         print(f"[OK] {node.id}: reverse client active, entry 127.0.0.1:{node.gost.hub_entry_port}")
     finally:
+        if binary is not None:
+            _cleanup_extract(binary)
         client.close()
 
 
