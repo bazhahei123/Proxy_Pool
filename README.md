@@ -1,84 +1,198 @@
-# Python GOST 代理池
+# Python GOST Proxy Pool
 
-这是同步 Python 代理池。第一阶段由中间 VPS 运行 GOST Relay，远端节点主动回连；SSH/SCP 只在 `install.py` 部署阶段使用，安装完成后由 systemd 维持隧道。
+<a href="README.md">English</a> | <a href="README.zh-CN.md">中文</a>
 
-## 安装
+This project builds a unified proxy pool on self-owned servers and provides multiple public egress IPs for HTTP/HTTPS requests. The client selects and rotates proxy addresses through three modes, so application code does not need to manage each server separately.
 
-在中间 VPS 的终端中执行：
+The server groups multiple proxy VPS nodes into one pool, while the client decides when to rotate. Deployment uploads and starts the tunnel automatically; normal use is through the client API or CLI.
+
+## Architecture
+
+```mermaid
+flowchart LR
+    CLI[Engine Client / CLI\nRules and request retries]
+    GW[Hub VPS Gateway\nUnified HTTP proxy entry]
+    RELAY[GOST Relay\nReverse tunnel hub]
+    P1[Proxy VPS 1\nGOST egress]
+    P2[Proxy VPS 2\nGOST egress]
+    P3[Proxy VPS 3\nGOST egress]
+    TARGET[Authorized test target]
+
+    CLI -- "HTTP / HTTPS CONNECT\nSession ID" --> GW
+    GW -- "Session binding\nNode rotation" --> RELAY
+    RELAY <-. "Reverse tunnel\noutbound connection" .-> P1
+    RELAY <-. "Reverse tunnel" .-> P2
+    RELAY <-. "Reverse tunnel" .-> P3
+    P1 --> TARGET
+    P2 --> TARGET
+    P3 --> TARGET
+```
+
+
+## Server configuration
+
+Edit `server/server_config.yaml` before installation:
+
+```yaml
+reverse_tunnel:
+  enabled: true
+  hub_host: "PUBLIC_HUB_VPS_IP"
+  relay_host: "0.0.0.0"
+  relay_port: 443
+  entry_host: "127.0.0.1"
+  entry_port_base: "11000-12000"
+
+gateway:
+  enabled: true
+  listen_host: "0.0.0.0"
+  listen_port: 8080
+  username: proxy
+  password: "${GATEWAY_PASSWORD}"
+  session_ttl_seconds: 300
+```
+
+Fill in SSH details, node IDs, and the GOST binary directory for each remote node, using `reverse_gost_client` as the node kind. Ports are assigned in node order; each node tries up to five occupied ports. The mapping is saved to `state/entry_ports.json` and reused by Gateway restarts. Open TCP 443 and TCP 8080 in the hub security group; ports 11000-12000 bind only on the hub.
+
+## Server installation
+
+Run these commands on the hub VPS:
 
 ```cmd
 cd /path/to/proxy/server
 python3 -m pip install -r requirements.txt
-export SSH_PASSWORD='服务器SSH密码'
-export GOST_PROXY_PASSWORD='Relay密码'
+export SSH_PASSWORD='server SSH password'
+export GOST_PROXY_PASSWORD='Relay password'
 python3 install.py server_config.yaml
 ```
 
-在反向模式下，安装程序会先在中间 VPS 启动 Relay，再自动识别每台远端 VPS 的 amd64/arm64 架构、上传 GOST、创建反向客户端 systemd 服务，最后通过自动分配的入口端口进行出口 IP 健康检查。
+In reverse mode the installer starts the Relay on the hub, detects amd64 or arm64 on every remote VPS, uploads GOST, creates reverse client systemd services, and checks that the tunnels and services started successfully.
 
-停止全部隧道但保留文件，便于之后重新启动：
+After installation, entry port assignments are saved in `state/entry_ports.json`. Gateway startup and restart reuse this mapping instead of reallocating ports for established tunnels.
+
+## Server status, logs, and uninstall
+
+Service status:
+
+```bash
+sudo systemctl status proxy-pool-gateway.service
+sudo systemctl status proxy-pool-gost-relay.service
+```
+
+Gateway logs are stored at `server/log/gateway.log`. Follow the log:
+
+```bash
+tail -f /path/to/proxy/server/log/gateway.log
+```
+
+View systemd logs and listening ports:
+
+```bash
+sudo journalctl -u proxy-pool-gateway.service -n 100 --no-pager
+sudo journalctl -u proxy-pool-gost-relay.service -n 100 --no-pager
+sudo ss -lntp | grep -E '110[0-9][0-9]|8080|443'
+```
+
+Server uninstall:
 
 ```bash
 python3 uninstall.py stop server_config.yaml
-```
-
-删除远端通过 SCP 上传的 GOST 文件：
-
-```bash
 python3 uninstall.py clean server_config.yaml
-```
-
-删除远端 GOST 文件以及中间 VPS 本地安装目录：
-
-```bash
 python3 uninstall.py purge server_config.yaml
 ```
 
-## 配置
+`stop` stops services, `clean` also removes remote GOST binaries, and `purge` also removes the local hub installation directory.
 
-服务端配置使用 `server/server_config.yaml`。将 `reverse_tunnel.enabled` 设为 `true`，填写中间 VPS 的 `hub_host`，节点使用 `kind: reverse_gost_client`。`entry_port_base: "11000-11010"` 会按节点顺序自动分配端口，不需要填写 `hub_entry_port`。
+## Client installation and usage
 
-云安全组只需放行中间 VPS 的 Relay 入站端口；远端 VPS 不需要暴露 1080。
+Install the client on the machine that sends HTTP/HTTPS requests. It connects to the Gateway on the hub VPS, does not change the system proxy, and does not install GOST on the client machine.
 
-启用 `gateway.enabled` 后，`server/install.py` 还会启动中间 VPS 的统一 HTTP Gateway。引擎侧客户端使用 `client/client_config.yaml` 连接它；客户端支持 `rules`、`fixed_count` 和 `random` 三种模式。
-
-## 健康检查
+Before installation, edit `client/client_config.yaml` with the hub address and client mode:
 
 ```yaml
-diagnostics:
-  ip_check_url: "https://ip.3322.net"
-  health_urls:
-    - "https://你的授权测试站点/health"
+gateway:
+  url: "http://PUBLIC_HUB_VPS_IP:8080"
+  username: proxy
+  password: "${GATEWAY_PASSWORD}"
+  verify_tls: true
+  timeout_seconds: 30
+
+selector:
+  mode: rules
+  rotate_after: 5
+  max_attempts_on_403: 3
+  block_statuses: [403, 418, 429]
 ```
 
-`ip.3322.net` 用来确认代理后的公网出口 IP；无法访问时可以换成自有接口。健康 URL 应返回 200-399，403 页面应作为业务目标而不是安装健康地址。
+Install dependencies and validate the connection from the `client` directory:
 
-## 同步调用
+```bash
+cd /path/to/proxy/client
+python3 -m pip install -r requirements.txt
+export GATEWAY_PASSWORD='Gateway password'
+python3 install_client.py client_config.yaml
+```
+
+Installation saves the configuration to `~/.proxy-pool/client_config.yaml`, so later CLI calls do not need `--config`. Set the hub public address in `gateway.url`, for example `http://38.207.176.121:8080`. In Windows CMD use `set "GATEWAY_PASSWORD=Gateway password"`.
+
+## Client modes
+
+Rules mode rotates on configured block statuses and tries at most three nodes:
+
+```bash
+python3 client_cli.py request --mode rules http://authorized.example/deny
+```
+
+To test 403 rotation, start a test page on a host reachable from the proxy nodes:
+
+```bash
+python3 test_403_server.py --host 0.0.0.0 --port 18080 --status 403
+```
+
+Fixed-count mode ignores 403, 418, and 429 and rotates only after the configured number of logical requests. Multiple targets run in one session:
+
+```bash
+python3 client_cli.py request --mode fixed_count https://target-01.example https://target-02.example https://target-03.example
+```
+
+Random mode ignores response status and chooses a random proxy node for each target:
+
+```bash
+python3 client_cli.py request --mode random https://target-01.example https://target-02.example https://target-03.example
+```
+
+Check Gateway and session status:
+
+```bash
+python3 client_cli.py health
+```
+
+Python API usage:
 
 ```python
-from proxy_pool import ProxyPool
+from proxy_client import ProxyClient
 
-pool = ProxyPool.connect("server/server_config.yaml")
+client = ProxyClient.from_config("client_config.yaml")
 try:
-    result = pool.request(method="GET", url="https://example.com")
-    print(result.response.status_code, result.proxy_id, result.egress_ip, result.attempts)
+    result = client.request("GET", "https://example.com")
+    print(result.response.status_code, result.proxy_id, result.attempts)
 finally:
-    pool.close()
+    client.close()
 ```
 
-运行时只连接已安装的 GOST，不重复 SSH、SCP 或部署。403、418、429 会在不同节点间有限重试。
+Uninstall the client on Linux or Windows:
 
-## 403 测试
-
-```cmd
-python test_403_server.py --host 0.0.0.0 --port 18080 --status 403
+```bash
+python3 uninstall_client.py
 ```
 
-安装完成后，入口端口映射会保存到 `state/entry_ports.json`。Gateway 启动或重启时读取该文件，不会重新分配已建立隧道的端口。
-# 第一阶段：中间 VPS 反向隧道
+Add `--purge` to remove the saved default configuration and local cache:
 
-第一阶段的 `install.py` 应在中间 VPS 上运行。将 `reverse_tunnel.enabled` 设为 `true` 后，脚本会在中间 VPS 启动 GOST Relay，再通过 SSH 将 GOST 客户端安装到每个 `reverse_gost_client` 节点。SSH 只用于安装；systemd 服务会在后台持续回连 Relay。
+```bash
+python3 uninstall_client.py --purge
+```
 
-`entry_port_base` 可以写成 `11000` 或 `11000-11010`。启用节点按配置顺序自动获得入口端口，不需要在节点下填写 `hub_entry_port`。分配时会从当前游标开始逐个探测；端口被占用就继续尝试下一个，单个节点最多尝试 5 个端口。某个节点成功后，下一个节点从后一个端口继续。入口只绑定中间 VPS 的 `entry_host`（默认 `127.0.0.1`），不会把 SOCKS 服务直接暴露到公网。
+For request failures, inspect the Gateway log on the hub VPS:
 
-云厂商安全组只需放行中间 VPS 的 Relay 入站端口（例如 TCP 443），远端 VPS 只需能主动出站连接该端口。
+```bash
+tail -f /path/to/proxy/server/log/gateway.log
+```
