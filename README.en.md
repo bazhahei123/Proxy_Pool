@@ -71,6 +71,8 @@ Runtime only attaches to installed GOST endpoints. It does not repeat SSH, SCP, 
 ```cmd
 python test_403_server.py --host 0.0.0.0 --port 18080 --status 403
 ```
+
+After installation, entry port assignments are saved in `state/entry_ports.json`. Gateway startup and restart reuse this mapping instead of reallocating ports for established tunnels.
 # Phase 1: reverse tunnels on a hub VPS
 
 Run `install.py` on the hub VPS. With `reverse_tunnel.enabled: true`, it starts a GOST Relay on the hub and installs a GOST client on every `reverse_gost_client` node through SSH. SSH is used only for installation; systemd keeps each client connected to the Relay afterwards.

@@ -8,6 +8,19 @@ import yaml
 _ENV = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-(.*?))?\}")
 
 
+def default_config_path() -> Path:
+    return Path.home() / ".proxy-pool" / "client_config.yaml"
+
+
+def resolve_config_path(source: str | Path | None) -> Path:
+    if source:
+        return Path(source)
+    installed = default_config_path()
+    if installed.is_file():
+        return installed
+    return Path("client_config.yaml")
+
+
 def _expand(value):
     if isinstance(value, str):
         def replace(match):

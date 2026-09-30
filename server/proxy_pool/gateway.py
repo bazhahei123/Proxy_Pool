@@ -4,10 +4,13 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import logging
 import secrets
 import time
 import random
 from dataclasses import dataclass
+from logging.handlers import RotatingFileHandler
+from pathlib import Path
 from urllib.parse import urlsplit
 
 import httpx
@@ -15,6 +18,8 @@ import httpx
 from .config import load_config
 from .models import AppConfig, ProxyNodeConfig
 from .selector import ProxySelector
+
+LOGGER = logging.getLogger("proxy_pool.gateway")
 
 
 @dataclass
@@ -47,7 +52,21 @@ class Gateway:
             user, password = decoded.split(":", 1)
         except Exception:
             return False
+        if not api and "|" in password:
+            password = password.split("|", 1)[0]
         return secrets.compare_digest(user, self.config.gateway.username) and secrets.compare_digest(password, configured_password or "")
+
+    def _session_from_proxy_auth(self, headers: dict[str, str]) -> str | None:
+        value = headers.get("proxy-authorization", "")
+        if not value.lower().startswith("basic "):
+            return None
+        try:
+            decoded = base64.b64decode(value[6:]).decode()
+            _, password = decoded.split(":", 1)
+            _, session_id = password.split("|", 1)
+            return session_id or None
+        except Exception:
+            return None
 
     def _session(self, session_id: str | None) -> Session | None:
         if not session_id:
@@ -158,7 +177,8 @@ class Gateway:
                 upstream_reader, upstream_writer = await self._socks_connect(session.node, host, port)
                 writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n"); await writer.drain()
                 await self._pipe(reader=reader, writer=writer, target_reader=upstream_reader, target_writer=upstream_writer)
-            except Exception:
+            except Exception as exc:
+                LOGGER.error("CONNECT upstream failed: %s: %s", type(exc).__name__, exc)
                 writer.write(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n"); await writer.drain()
             return
         url = target if target.startswith(("http://", "https://")) else "http://" + target
@@ -172,7 +192,8 @@ class Gateway:
             writer.write(f"HTTP/1.1 {response.status_code} {response.reason_phrase}\r\n".encode())
             for key, value in response_headers: writer.write(f"{key}: {value}\r\n".encode())
             writer.write(f"Content-Length: {len(payload)}\r\nConnection: close\r\n\r\n".encode() + payload); await writer.drain()
-        except Exception:
+        except Exception as exc:
+            LOGGER.error("upstream proxy failed: %s: %s", type(exc).__name__, exc)
             writer.write(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n"); await writer.drain()
 
     async def handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
@@ -191,7 +212,7 @@ class Gateway:
             elif not self._auth_ok(headers):
                 writer.write(b"HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic\r\nContent-Length: 0\r\n\r\n"); await writer.drain()
             else:
-                session = self._session(headers.get("x-proxy-session"))
+                session = self._session(headers.get("x-proxy-session") or self._session_from_proxy_auth(headers))
                 if not session:
                     writer.write(b"HTTP/1.1 409 Session Required\r\nContent-Length: 0\r\n\r\n"); await writer.drain()
                 else:
@@ -203,10 +224,18 @@ class Gateway:
 
 
 async def serve(source: str) -> None:
-    config = load_config(source, allow_unset_env=True)
+    log_dir = Path(source).resolve().parent / "log"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    handler = RotatingFileHandler(log_dir / "gateway.log", maxBytes=10 * 1024 * 1024, backupCount=5, encoding="utf-8")
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+    LOGGER.setLevel(logging.INFO)
+    LOGGER.addHandler(handler)
+    LOGGER.info("Gateway starting; config=%s", Path(source).resolve())
+    config = load_config(source, allow_unset_env=True, probe_ports=False)
     if not config.gateway.enabled:
         raise RuntimeError("gateway.enabled is false")
     gateway = Gateway(config)
+    LOGGER.info("Gateway listening on %s:%s", config.gateway.listen_host, config.gateway.listen_port)
     server = await asyncio.start_server(gateway.handle, config.gateway.listen_host, config.gateway.listen_port)
     async with server:
         await server.serve_forever()

@@ -4,6 +4,7 @@ import base64
 import json
 from dataclasses import dataclass
 from typing import Any
+from urllib.parse import quote, urlsplit, urlunsplit
 
 import httpx
 
@@ -29,8 +30,13 @@ class ProxyClient:
         self._client: httpx.Client | None = None
 
     @classmethod
-    def from_config(cls, source):
-        client = cls(load_client_config(source))
+    def from_config(cls, source, *, mode: str | None = None):
+        config = load_client_config(source)
+        if mode is not None:
+            if mode not in {"rules", "fixed_count", "random"}:
+                raise ValueError("mode must be rules, fixed_count, or random")
+            config["selector"]["mode"] = mode
+        client = cls(config)
         client.health()
         return client
 
@@ -61,13 +67,22 @@ class ProxyClient:
     def _rebuild_client(self) -> None:
         if self._client:
             self._client.close()
-        proxy_auth = self._auth_headers().get("Authorization")
-        proxy_headers = {"X-Proxy-Session": self.session_id or ""}
-        if proxy_auth:
-            proxy_headers["Proxy-Authorization"] = proxy_auth
+        proxy_url = self.gateway["url"]
+        username = self.gateway.get("username")
+        if username is not None:
+            parsed = urlsplit(proxy_url)
+            user = quote(str(username), safe="")
+            # HTTPX 0.28 does not expose custom proxy headers. Encode the
+            # session token in the proxy credential; the Gateway extracts it
+            # before validating the upstream proxy request.
+            password = quote(f"{self.gateway.get('password') or ''}|{self.session_id or ''}", safe="")
+            host = parsed.hostname or ""
+            if parsed.port is not None:
+                host = f"{host}:{parsed.port}"
+            proxy_url = urlunsplit((parsed.scheme, f"{user}:{password}@{host}", parsed.path, parsed.query, parsed.fragment))
         self._client = httpx.Client(
-            proxy=self.gateway["url"],
-            proxy_headers=proxy_headers,
+            proxy=proxy_url,
+            headers={"X-Proxy-Session": self.session_id or ""},
             timeout=self.gateway["timeout_seconds"],
             verify=self.gateway["verify_tls"],
             follow_redirects=False,
@@ -102,12 +117,15 @@ class ProxyClient:
         if self._client is None:
             self._create_session()
         attempts = 0
-        max_attempts = self.selector["max_attempts_on_403"]
+        mode = self.selector["mode"]
+        # Only rules mode retries a response based on block statuses. The
+        # other modes deliberately ignore 403/418/429 and make one request.
+        max_attempts = self.selector["max_attempts_on_403"] if mode == "rules" else 1
         last = None
         for index in range(max_attempts):
-            if self.selector["mode"] == "random" and self.uses > 0:
+            if mode == "random" and self.uses > 0:
                 self._rotate()
-            if self.selector["mode"] == "fixed_count" and self.uses >= self.selector["rotate_after"]:
+            if mode == "fixed_count" and self.uses >= self.selector["rotate_after"]:
                 self._rotate()
             request_kwargs = dict(kwargs)
             if body_factory is not None:
@@ -119,10 +137,12 @@ class ProxyClient:
                 assert self._client is not None
                 response = self._client.request(method.upper(), url, **request_kwargs)
             except httpx.HTTPError as exc:
-                if index + 1 >= max_attempts: raise ClientRequestError(str(exc)) from exc
-                self._rotate(); continue
+                if mode != "rules" or index + 1 >= max_attempts:
+                    raise ClientRequestError(str(exc)) from exc
+                self._rotate()
+                continue
             attempts += 1; self.uses += 1; last = response
-            if response.status_code not in self.selector["block_statuses"] or index + 1 >= max_attempts:
+            if mode != "rules" or response.status_code not in self.selector["block_statuses"] or index + 1 >= max_attempts:
                 return ClientResult(response, self.proxy_id or "", attempts)
             self._rotate()
         if last is None:

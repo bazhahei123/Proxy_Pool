@@ -73,6 +73,8 @@ finally:
 ```cmd
 python test_403_server.py --host 0.0.0.0 --port 18080 --status 403
 ```
+
+安装完成后，入口端口映射会保存到 `state/entry_ports.json`。Gateway 启动或重启时读取该文件，不会重新分配已建立隧道的端口。
 # 第一阶段：中间 VPS 反向隧道
 
 第一阶段的 `install.py` 应在中间 VPS 上运行。将 `reverse_tunnel.enabled` 设为 `true` 后，脚本会在中间 VPS 启动 GOST Relay，再通过 SSH 将 GOST 客户端安装到每个 `reverse_gost_client` 节点。SSH 只用于安装；systemd 服务会在后台持续回连 Relay。

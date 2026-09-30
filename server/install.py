@@ -17,7 +17,7 @@ from proxy_pool.reverse_installer import install_reverse
 
 def _install_sync(config_path: str) -> None:
     """Install public GOST with SSH only as a bootstrap transport."""
-    config = load_config(config_path)
+    config = load_config(config_path, probe_ports=True)
     if not config.diagnostics.ip_check_url and not config.diagnostics.health_urls:
         raise RuntimeError(
             "configure diagnostics.ip_check_url or diagnostics.health_urls; "
@@ -99,7 +99,7 @@ def _find_artifact(binary_path, binary_dir, suffix):
 
 def _install_sync_reported(config_path: str) -> int:
     """Run installation with an explicit failure stage for every node."""
-    config = load_config(config_path)
+    config = load_config(config_path, probe_ports=True)
     if config.reverse_tunnel.enabled:
         return install_reverse(config, config_path)
     if not config.diagnostics.ip_check_url and not config.diagnostics.health_urls:

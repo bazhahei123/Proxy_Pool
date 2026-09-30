@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import re
 import socket
+import json
 from pathlib import Path
 from typing import Any
 
@@ -39,6 +40,31 @@ def _port_available(host: str, port: int) -> bool:
         sock.close()
 
 
+def _entry_state_path(source: str | Path | dict[str, Any] | AppConfig, base: Path) -> Path | None:
+    if isinstance(source, (str, Path)):
+        return base / "state" / "entry_ports.json"
+    return None
+
+
+def _read_entry_state(path: Path | None) -> dict[str, int]:
+    if path is None or not path.is_file():
+        return {}
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        return {str(key): int(value) for key, value in raw.items()}
+    except (OSError, ValueError, TypeError):
+        return {}
+
+
+def _write_entry_state(path: Path | None, mapping: dict[str, int]) -> None:
+    if path is None:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(".tmp")
+    temporary.write_text(json.dumps(mapping, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    temporary.replace(path)
+
+
 def _expand(value: Any, allow_unset: bool = False) -> Any:
     if isinstance(value, str):
         def repl(match: re.Match[str]) -> str:
@@ -73,7 +99,7 @@ def _required(mapping: dict[str, Any], key: str, path: str) -> Any:
     return mapping[key]
 
 
-def load_config(source: str | Path | dict[str, Any] | AppConfig, *, allow_unset_env: bool = False) -> AppConfig:
+def load_config(source: str | Path | dict[str, Any] | AppConfig, *, allow_unset_env: bool = False, probe_ports: bool = False) -> AppConfig:
     if isinstance(source, AppConfig):
         return source
     base = Path.cwd()
@@ -237,12 +263,19 @@ def load_config(source: str | Path | dict[str, Any] | AppConfig, *, allow_unset_
             )
         used: set[int] = set()
         next_port = reverse_tunnel.entry_port_base
+        state_path = _entry_state_path(source, base)
+        saved_ports = _read_entry_state(state_path)
+        if saved_ports:
+            next_port = max(next_port, max(saved_ports.values()) + 1)
         for node in reverse_nodes:
             assert node.gost is not None
             if node.gost.hub_entry_port is not None:
                 port = node.gost.hub_entry_port
                 next_port = max(next_port, port + 1)
-            else:
+            elif node.id in saved_ports and saved_ports[node.id] in available and saved_ports[node.id] not in used:
+                port = saved_ports[node.id]
+                next_port = max(next_port, port + 1)
+            elif probe_ports:
                 attempts: list[int] = []
                 port = None
                 candidate = next_port
@@ -261,9 +294,15 @@ def load_config(source: str | Path | dict[str, Any] | AppConfig, *, allow_unset_
                         f"no available reverse entry port for {node.id}; "
                         f"tried up to 5 ports: {attempted}"
                     )
+            else:
+                port = available[next_port - reverse_tunnel.entry_port_base] if next_port <= reverse_tunnel.entry_port_end else None
+                if port is None:
+                    raise ConfigError(f"reverse entry port range exhausted before {node.id}")
+                next_port += 1
             if port in used or port not in available:
                 raise ConfigError(f"duplicate or out-of-range reverse entry port {port} for {node.id}")
             node.gost.hub_entry_port = port
             node.gost.public_host = reverse_tunnel.hub_entry_host
             used.add(port)
+        _write_entry_state(state_path, {node.id: node.gost.hub_entry_port for node in reverse_nodes if node.gost and node.gost.hub_entry_port is not None})
     return AppConfig(runtime, selector, diagnostics, nodes, gost_binary, gost_binary_dir, str(gost_raw.get("version", "3.x")), gost_raw.get("sha256"), reverse_tunnel, gateway)
